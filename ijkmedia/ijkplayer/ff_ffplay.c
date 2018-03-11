@@ -36,6 +36,9 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <unistd.h>
+// add some new headers for new live mode
+#include "libavcodec/avcodec.h"
+#include "libavformat/internal.h"
 
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
@@ -361,6 +364,57 @@ static int packet_queue_get_or_buffering(FFPlayer *ffp, PacketQueue *q, AVPacket
     return 1;
 }
 
+
+#if NEW_LIVE_MODE
+// 简化丢帧函数
+static void packet_queue_drop(PacketQueue *q, int drop_num){
+    MyAVPacketList *pkt1 = NULL;
+    int del_nb_packets = 0;
+    if(q->type != 2)
+        return;
+    for(;;){
+        if(del_nb_packets >= drop_num && q->type == 2){
+            // 丢帧数量（只能用于丢音频帧）
+            break;
+        }
+        pkt1 = q->first_pkt;
+        if(!pkt1){
+            break;
+        }
+        q->first_pkt = pkt1->next;
+        if(!q->first_pkt){
+            q->last_pkt = NULL;
+        }
+        q->nb_packets--;
+        del_nb_packets++;
+        q->size-=pkt1->pkt.size+sizeof(*pkt1);
+        if(pkt1->pkt.duration>0){
+            q->duration-=pkt1->pkt.duration;
+        }
+        av_free_packet(&pkt1->pkt);
+#ifdef FFP_MERGE
+        av_free(pkt1);
+#else
+        pkt1->next = q->recycle_pkt;
+        q->recycle_pkt = pkt1;
+#endif
+    }
+    ALOGI("simple drop packets number = %d .\n",del_nb_packets);    
+}
+// 丢帧时限控制 TODO need optimize
+static void set_queue_drop_duration(VideoState *is, int64_t control_duration){
+    // 使用单位时间内pts差变动作为丢帧时限依据
+    is->cur_cached_duration += control_duration;
+    if(is->cur_cached_duration < is->min_cached_duration || is->cur_cached_duration > is->max_cached_duration){
+        is->cur_cached_duration = is->cur_cached_duration <is->min_cached_duration ? is->min_cached_duration: is->max_cached_duration;
+    }
+    ALOGI("cur drop target = %lld.\n",is->cur_cached_duration);
+}
+#endif
+
+
+
+
 static void decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, SDL_cond *empty_queue_cond) {
     memset(d, 0, sizeof(Decoder));
     d->avctx = avctx;
@@ -585,6 +639,25 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
                     d->next_pts_tb = d->start_pts_tb;
                 }
             } while (pkt.data == flush_pkt.data || d->queue->serial != d->pkt_serial);
+            // here
+            // if(d->avctx->codec_type == AVMEDIA_TYPE_VIDEO){
+            //     AVPacket *pkt1;
+            //     pkt1 = &pkt;
+            //     if(ffp->new_live_mode && pkt1->data){
+            //         uint8_t *buf = pkt1->data;
+            //         int idc, type;
+            //         idc = buf[4]>>5;  // 这里发生过crash
+            //         type = buf[4] & 0x1F;
+            //         if(6 == type)
+            //         {
+            //             // get sei info from h264 (yizhibo QA stream)
+            //             unsigned char *sei_data = buf + 16 +6 + 1;
+            //             // memcpy(ffp->qos_info.qos_sei_data, sei_data, 37);
+            //             av_log(NULL,AV_LOG_INFO,"zdp22 now:%lld  sei: %s\n",av_gettime(),sei_data);
+            //         }
+            //     }
+            // }
+
             av_packet_unref(&d->pkt);
             d->pkt_temp = d->pkt = pkt;
             d->packet_pending = 1;
@@ -1380,6 +1453,17 @@ retry:
         }
 display:
         /* display picture */
+
+        if(ffp->first_show_frame){
+
+#if NEW_LIVE_MODE
+            if(ffp->new_live_mode)
+                ffp->packet_buffering = 1; // 开启缓冲
+#endif
+
+            ffp->first_show_frame = 0
+        }
+
         if (!ffp->display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown)
             video_display2(ffp);
     }
@@ -2263,6 +2347,14 @@ static int ffplay_video_thread(void *arg)
             duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
             pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
             ret = queue_picture(ffp, frame, pts, duration, av_frame_get_pkt_pos(frame), is->viddec.pkt_serial);
+
+#if NEW_LIVE_MODE
+            //首屏加速
+            if(is->new_live_mode && ffp->first_show_frame)
+                is->force_refresh = 1;
+#endif 
+            
+
             av_frame_unref(frame);
 #if CONFIG_AVFILTER
         }
@@ -2968,6 +3060,170 @@ static int is_realtime(AVFormatContext *s)
     return 0;
 }
 
+#if NEW_LIVE_MODE
+// 解决有时候直播流找不到音频的bug
+static int refind_stream(FFPlayer *ffp, AVFormatContext *ic, int stream_index, int type){
+    // refind the audio or video stream
+    if(stream_index >= 0){
+        stream_component_open(ffp,stream_index);
+    }
+    ijkmeta_set_avformat_context_l(ffp->meta,ic);
+    if(stream_index >= 0){
+        if(type == 1){
+            ijkmeta_set_int64_l(ffp->meta,IJKM_KEY_AUDIO_STREAM,stream_index);
+        }else if(type == 2){
+            ijkmeta_set_int64_l(ffp->meta,IJKM_KEY_VIDEO_STREAM,stream_index);
+        }
+    }
+    return 0;
+}
+#endif
+
+#if NEW_LIVE_MODE
+// 直播模式 快速获取stream info
+static int add_to_pktbuf(AVPacketList **packet_buffer, AVPacket *pkt, AVPacketList **plast_pktl, int ref){
+    // this function copy from ffmpeg in libavformat/utils.c
+    AVPacketList *pktl = av_mallocz(sizeof(AVPacketList));
+    int ret;
+    if (!pktl)
+        return AVERROR(ENOMEM);
+    if (ref) {
+        if ((ret = av_packet_ref(&pktl->pkt, pkt)) < 0) {
+            av_free(pktl);
+            return ret;
+        }
+    } else {
+        pktl->pkt = *pkt;
+    }
+    if (*packet_buffer)
+        (*plast_pktl)->next = pktl;
+    else
+        *packet_buffer = pktl;
+    *plast_pktl = pktl;
+    return 0;
+}
+// find stream info for live mode (only one loop) replace the avformat_find_stream_info
+static int live_find_stream_info(AVFormatContext *ic, AVDictionary **options){
+    int i, count = 0, ret = 0, j;
+    int64_t read_size;
+    AVStream *st;
+    AVCodecContext *avctx;
+    AVPacket pkt1, *pkt;
+    int64_t old_offset = avio_tell(ic->pb);
+    int orig_nb_streams = ic->nb_streams;
+    int video_index = -1;
+    int audio_index = -1;
+    av_opt_set(ic, "skip_clear","1",AV_OPT_SEARCH_CHILDREN);
+    if(ic->pb){
+        av_log(ic, AV_LOG_DEBUG, "Before live_find_stream_info() pos: %"PRId64" bytes read:%"PRId64" seeks:%d nb_streams:%d\n",
+            avio_tell(ic->pb), ic->pb->bytes_read, ic->pb->seek_count, ic->nb_streams);
+    }
+    // use the av_read_frame() instand of read_frame_internal()
+    ret = av_read_frame(ic,&pkt1);
+    if(ret < 0)
+        return -1;
+    pkt = &pkt1;
+    if(!(ic->flags & AVFMT_FLAG_NOBUFFER)){
+        ret = add_to_pktbuf(&ic->internal->packet_buffer, pkt,&ic->internal->packet_buffer_end, 0);
+        if(ret < 0)
+            goto find_stream_info_err;
+    }
+    st = ic->streams[pkt->stream_index];
+    avctx = st->internal->avctx;
+    if(!st->internal->avctx_inited){
+        ret = avcodec_parameters_to_context(avctx,st->codecpar);
+        if(ret < 0)
+            goto find_stream_info_err;
+        st->internal->avctx_inited = 1;
+    }
+    if(ic->flags & AVFMT_FLAG_NOBUFFER){
+        av_packet_unref(pkt);
+    }
+    st->codec_info_nb_frames++;
+    // TODO some bug, maybe only video stream and no audio stream
+    if (2 == ic->nb_streams) {
+        if (AVMEDIA_TYPE_VIDEO == ic->streams[0]->codec->codec_type) {
+            video_index = 0;
+            audio_index = 1;
+        } else if (AVMEDIA_TYPE_VIDEO == ic->streams[1]->codec->codec_type) {
+            video_index = 1;
+            audio_index = 0;
+        }
+    }
+
+    if(video_index != 0 && video_index != 1)
+        return ret;
+    // TODO maybe no need to set these param
+    if(2 == ic->nb_streams){
+        ic->streams[audio_index]->codecpar->profile = 4;
+        ic->streams[audio_index]->codecpar->format = 8;
+        ic->streams[audio_index]->codecpar->frame_size = 1024; // for audio_cache.duration 
+        // ic->streams[video_index]->pts_wrap_bits = 32;
+        // ic->streams[video_index]->time_base.den = 1000;
+        // ic->streams[video_index]->time_base.num = 1;
+        // ic->streams[video_index]->avg_frame_rate.den = 0;
+        // ic->streams[video_index]->avg_frame_rate.num = 0;
+        // ic->streams[video_index]->r_frame_rate.den = 1;
+        // ic->streams[video_index]->r_frame_rate.num = 1000;
+        // ic->streams[video_index]->codecpar->codec_id = 28;
+        // ic->streams[video_index]->codecpar->profile = 66;
+        // ic->streams[video_index]->codecpar->format = 0;
+        // ic->streams[video_index]->codecpar->bits_per_coded_sample = 8;
+        // ic->streams[video_index]->codecpar->level = 30;
+    }
+    av_opt_set(ic, "skip_clear", "0", AV_OPT_SEARCH_CHILDREN);
+    for(i = 0;i < ic->nb_streams; i++){
+        st = ic->streams[i];
+        if (st->internal->avctx_inited) {
+         ret = avcodec_parameters_from_context(st->codecpar, st->internal->avctx);
+         if (ret < 0)
+             goto find_stream_info_err;
+        }
+        ret = avcodec_parameters_to_context(st->codec, st->codecpar);
+        if (ret < 0)
+         goto find_stream_info_err;
+        if (st->codec->codec_tag != MKTAG('t','m','c','d'))
+         st->codec->time_base = st->internal->avctx->time_base;
+        st->codec->framerate = st->avg_frame_rate;
+        st->codec->coded_width = st->internal->avctx->coded_width;
+        st->codec->coded_height = st->internal->avctx->coded_height;
+        st->codec->properties = st->internal->avctx->properties;
+        st->internal->avctx_inited = 0;
+    }
+find_stream_info_err:
+    for (i = 0; i < ic->nb_streams; i++) {
+        st = ic->streams[i];
+        if (st->info)
+            av_freep(&st->info->duration_error);
+        av_freep(&ic->streams[i]->info);
+    }
+    if (ic->pb)
+        av_log(ic, AV_LOG_DEBUG, "After live_find_stream_info() pos: %"PRId64" bytes read:%"PRId64" seeks:%d frames:%d\n",
+            avio_tell(ic->pb), ic->pb->bytes_read, ic->pb->seek_count, count);
+    return ret;    
+}
+#endif
+
+#if NEW_LIVE_MODE
+
+// 重新链接地址 重新构建ic
+static AVFormatContext *live_reconnect_private(FFPlayer *ffp){
+    VideoState *is = ffp->is;
+    int err;
+    AVFormatContext *ic = NULL;
+    ic = avformat_alloc_context();
+    err = avformat_open_input(&ic,is->filename,is->iformat,&ffp->format_opts);
+    if(err < 0)
+        return NULL;
+    err = avformat_find_stream_info(ic,NULL);
+    if(err < 0)
+        return NULL;
+    ic->pb->eof_reached = 0;
+    return ic;
+}
+#endif
+
+
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -2990,6 +3246,19 @@ static int read_thread(void *arg)
     int64_t prev_io_tick_counter = 0;
     int64_t io_tick_counter = 0;
 
+#if NEW_LIVE_MODE
+    // 设置直播模式开关
+    is->new_live_mode = ffp->new_live_mode; 
+    // 直播模式 定时参数设置
+    int64_t prev_drop_packets_tick_counter = 0;
+    int64_t drop_packets_tick_counter = 0;
+    int64_t prev_packets_pts =0;
+    int64_t packets_pts = 0;
+    int64_t check_duration = 0;   
+
+#endif
+
+
     if (!wait_mutex) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
         ret = AVERROR(ENOMEM);
@@ -3001,6 +3270,11 @@ static int read_thread(void *arg)
     is->last_audio_stream = is->audio_stream = -1;
     is->last_subtitle_stream = is->subtitle_stream = -1;
     is->eof = 0;
+
+    if(ffp->new_live_mode){
+        ffp_set_option_internal(&ffp->format_opts, ffp->options_mutex, "stimeout", "10000", 0);
+    }
+
 
     ic = avformat_alloc_context();
     if (!ic) {
@@ -3067,7 +3341,16 @@ static int read_thread(void *arg)
                 break;
             }
         }
+#if NEW_LIVE_MODE
+        // 直播模式使用live_find_stream_info 
+        if(is->new_live_mode && strcmp(ic->iformat->name, "flv") == 0){
+            err = live_find_stream_info(ic,NULL);
+        }else{
+            err = avformat_find_stream_info(ic, NULL);
+        }
+#else
         err = avformat_find_stream_info(ic, opts);
+#endif
     } while(0);
     ffp_notify_msg1(ffp, FFP_MSG_FIND_STREAM_INFO);
 
@@ -3113,6 +3396,40 @@ static int read_thread(void *arg)
     }
 
     is->realtime = is_realtime(ic);
+
+#if NEW_LIVE_MODE
+    //设置直播模式的的丢帧控制参数
+    if(is->new_live_mode){
+        // TODO realtime set to 0 or 1
+        is->realtime = 0;
+        AVDictionaryEntry *e = av_dict_get(ffp->player_opts,"max_cached_duration",NULL,0);
+        AVDictionaryEntry *e2 = av_dict_get(ffp->player_opts,"min_cached_duration",NULL,0);
+        if(e){
+            int max_cached_duration = atoi(e->value);
+            if(max_cached_duration <= 0){
+                is->max_cached_duration = 0;
+            }else{
+                is->max_cached_duration = max_cached_duration;
+            }
+        }else{
+            is->max_cached_duration = 0;
+        }
+        if(e2){
+            int min_cached_duration = atoi(e2->value);
+            if(min_cached_duration <= 0){
+                is->min_cached_duration = 0;
+            }else{
+                is->min_cached_duration = min_cached_duration;
+            }
+        }else{
+            is->min_cached_duration = 0;
+        }
+        is->cur_cached_duration = is->min_cached_duration;
+    }else{
+        is->cur_cached_duration = is->min_cached_duration = is->max_cached_duration =0;
+    }    
+#endif
+
 
     av_dump_format(ic, 0, is->filename, 0);
 
@@ -3409,6 +3726,55 @@ static int read_thread(void *arg)
         pkt->flags = 0;
         ret = av_read_frame(ic, pkt);
         if (ret < 0) {
+#if NEW_LIVE_MODE
+            // 超时重启和断流重启 TODO
+            if(ffp->new_live_mode && is->paused && (ic->pb->error || ret == AVERROR_EOF)) {
+                ffp_notify_msg1(ffp, FFP_MSG_BUFFERING_START);
+                // close the stream
+                if(is->audio_stream >= 0)
+                    stream_component_close(ffp, is->audio_stream);
+                if(is->video_stream >= 0)
+                    stream_component_close(ffp, is->video_stream);
+                if(ic && is->ic)
+                    avformat_close_input(&is->ic);
+                // re_open the ic
+                ALOGI("re_open the url");
+                AVFormatContext *ic_t = NULL;
+                int retry_count = 0;
+                while(ic_t==NULL){
+                    if(is->abort_request){
+                        goto fail;
+                    }
+                    if(retry_count > 6 ){
+                        if(ffp->error)
+                            ffp_notify_msg3(ffp, FFP_MSG_ERROR, ffp->error, ffp->error_wf_detail);
+                        else
+                            ffp_notify_msg1(ffp, FFP_MSG_COMPLETED);
+                        goto fail;
+                    }
+                    retry_count++;
+                    ic_t = NULL;
+                    ic_t = live_reconnect_private(ffp);
+                    int loop_count = 0;
+                    while(ic_t == NULL && !is->abort_request && loop_count <15){
+                        SDL_Delay(100);
+                        loop_count++;
+                    }
+                }
+                if(ic_t != NULL){
+                    // 设置一些重启参数
+                    ALOGI("re_read the metadata success");
+                    ic = ic_t;
+                    is->ic = ic;
+                    ffp->is = is;
+                    completed = 0;
+                    continue;
+                }
+            }
+#endif
+
+
+
             int pb_eof = 0;
             int pb_error = 0;
             if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof) {
@@ -3461,6 +3827,36 @@ static int read_thread(void *arg)
             is->eof = 0;
         }
 
+#if NEW_LIVE_MODE
+        // refinf the audio stream and video stream if no stream, for new live mode
+        if(is->new_live_mode){
+            // 当直播没有音频时重新发现音频流 可用于断流重启中
+            if(is->audio_stream < 0){
+                if(!ffp->audio_disable){
+                    int audio_stream_idx = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO, st_index[AVMEDIA_TYPE_AUDIO], st_index[AVMEDIA_TYPE_VIDEO],NULL, 0); 
+                    if(audio_stream_idx >= 0){
+                        refind_stream(ffp,ic,audio_stream_idx,1);
+                    }
+                }
+            }
+            // 重新发现视频流 断流重启中使用
+            if(is->video_stream < 0){
+                if(!ffp->video_disable){
+                    int video_stream_idx = av_find_best_stream(ic,AVMEDIA_TYPE_VIDEO,st_index[AVMEDIA_TYPE_VIDEO], st_index[AVMEDIA_TYPE_AUDIO],NULL,0);
+                    if(video_stream_idx >=0){
+                        refind_stream(ffp, ic, video_stream_idx,2);
+                    }
+                    // 设置重新开始播放
+                    is->paused =0;
+                    is->pause_req =0;
+                    ffp_toggle_buffering(ffp, 0);
+                    ffp_notify_msg1(ffp, FFP_MSG_BUFFERING_END);
+                }
+            }
+        }
+#endif
+
+
         if (pkt->flags & AV_PKT_FLAG_DISCONTINUITY) {
             if (is->audio_stream >= 0) {
                 packet_queue_put(&is->audioq, &flush_pkt);
@@ -3481,6 +3877,38 @@ static int read_thread(void *arg)
                 av_q2d(ic->streams[pkt->stream_index]->time_base) -
                 (double)(ffp->start_time != AV_NOPTS_VALUE ? ffp->start_time : 0) / 1000000
                 <= ((double)ffp->duration / 1000000);
+
+#if NEW_LIVE_MODE
+        // 直播模式丢帧检测控制
+        if(is->new_live_mode){
+            // 简化版的丢帧方法，每个GOP循环丢一定的帧
+            if(!is->paused && !ffp->qos_info.qos_first_show_video_frame && is->audioq.nb_packets > 20
+                && pkt->stream_index == is->video_stream && pkt->flags & AV_PKT_FLAG_KEY
+                &&  ffp->stat.audio_cache.duration > is->cur_cached_duration){
+                SDL_LockMutex(is->audioq.mutex);
+                if(ffp->stat.audio_cache.duration > is->max_cached_duration){
+                    packet_queue_drop(&is->audioq,4);
+                }else{
+                    packet_queue_drop(&is->audioq,3);
+                }
+                SDL_UnlockMutex(is->audioq.mutex);
+                // 动态设置丢帧界限
+                if(is->audioq.last_pkt){
+                    drop_packets_tick_counter = SDL_GetTickHR();
+                    packets_pts = is->audioq.last_pkt->pkt.pts;
+                    if(prev_drop_packets_tick_counter != 0 && prev_packets_pts != 0){
+                        check_duration = ((drop_packets_tick_counter - prev_drop_packets_tick_counter) - (packets_pts - prev_packets_pts));
+                        set_queue_drop_duration(is,check_duration);
+                    }
+                    prev_drop_packets_tick_counter = drop_packets_tick_counter; // time
+                    prev_packets_pts = packets_pts; // pts  
+                }
+            }
+        }
+#endif
+
+
+
         if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
             packet_queue_put(&is->audioq, pkt);
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
@@ -4160,6 +4588,16 @@ int ffp_prepare_async_l(FFPlayer *ffp, const char *file_name)
     av_log(NULL, AV_LOG_INFO, "===================\n");
 
     av_opt_set_dict(ffp, &ffp->player_opts);
+
+#if NEW_LIVE_MODE
+    // set some param for new live mode fast show
+    if(ffp->new_live_mode){
+        ffp->start_on_prepared = 1; // for fast first frame show
+        ffp->enable_fast_show_video = 1; // for fast first frame show
+    }
+#endif
+
+
     if (!ffp->aout) {
         ffp->aout = ffpipeline_open_audio_output(ffp->pipeline, ffp);
         if (!ffp->aout)

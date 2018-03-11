@@ -66,6 +66,11 @@
 #include "ff_ffpipenode.h"
 #include "ijkmeta.h"
 
+// 直播模式和最大丢帧数
+#define MAX_DROP_PACKETS 3 // max drop packets num in 1000ms
+#define NEW_LIVE_MODE    1 // new live mode 
+
+
 #define DEFAULT_HIGH_WATER_MARK_IN_BYTES        (256 * 1024)
 
 /*
@@ -414,6 +419,17 @@ typedef struct VideoState {
     SDL_mutex *accurate_seek_mutex;
     SDL_cond  *video_accurate_seek_cond;
     SDL_cond  *audio_accurate_seek_cond;
+
+#if NEW_LIVE_MODE
+    // 丢帧控制参数
+    int64_t cur_cached_duration; // current drop cached duration
+    int64_t max_cached_duration; // max drop duration
+    int64_t min_cached_duration; // min drop duration
+    int new_live_mode; // new live mode flag in is(videostate)
+#endif
+
+
+
 } VideoState;
 
 /* options specified by the user */
@@ -710,6 +726,16 @@ typedef struct FFPlayer {
     int skip_calc_frame_rate;
     int get_frame_mode;
     GetImgInfo *get_img_info;
+
+#if NEW_LIVE_MODE
+    // 直播相关参数
+    int new_live_mode; // new live mode flag in ffp
+
+    int first_show_frame;
+
+#endif
+
+
 } FFPlayer;
 
 #define fftime_to_milliseconds(ts) (av_rescale(ts, 1000, AV_TIME_BASE))
@@ -827,6 +853,8 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->pf_playback_rate_changed       = 0;
     ffp->pf_playback_volume             = 1.0f;
     ffp->pf_playback_volume_changed     = 0;
+
+    ffp->first_show_frame = 1;
 
     av_application_closep(&ffp->app_ctx);
     ijkio_manager_destroyp(&ffp->ijkio_manager_ctx);
