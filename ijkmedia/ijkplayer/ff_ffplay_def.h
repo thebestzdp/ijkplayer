@@ -66,6 +66,12 @@
 #include "ff_ffpipenode.h"
 #include "ijkmeta.h"
 
+// for new live mode
+#define MAX_DROP_PACKETS 3
+#define NEW_LIVE_MODE 1 
+
+
+
 #define DEFAULT_HIGH_WATER_MARK_IN_BYTES        (256 * 1024)
 
 /*
@@ -414,6 +420,11 @@ typedef struct VideoState {
     SDL_mutex *accurate_seek_mutex;
     SDL_cond  *video_accurate_seek_cond;
     SDL_cond  *audio_accurate_seek_cond;
+
+    // for new live mode
+    int max_cached_duration;
+    int new_live_mode;
+
 } VideoState;
 
 /* options specified by the user */
@@ -710,6 +721,13 @@ typedef struct FFPlayer {
     int skip_calc_frame_rate;
     int get_frame_mode;
     GetImgInfo *get_img_info;
+
+    // for new live mode
+    int64_t input_packets_num;
+    int64_t input_packets_num_video;
+    int live_buf_on;
+    int first_show_video_frame;
+
 } FFPlayer;
 
 #define fftime_to_milliseconds(ts) (av_rescale(ts, 1000, AV_TIME_BASE))
@@ -814,6 +832,8 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->iformat_name                   = NULL; // option
 
     ffp->no_time_adjust                 = 0; // option
+
+    ffp->first_show_video_frame = 1;
 
     ijkmeta_reset(ffp->meta);
 

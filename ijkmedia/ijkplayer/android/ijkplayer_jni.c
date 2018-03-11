@@ -1005,6 +1005,12 @@ static void message_loop_n(JNIEnv *env, IjkMediaPlayer *mp)
                 post_event2(env, weak_thiz, MEDIA_GET_IMG_STATE, msg.arg1, msg.arg2, NULL);
             }
             break;
+
+        // for new live mode
+        case 111:
+            post_event(env,weak_thiz,MEDIA_INFO,706,0);
+            break;
+
         default:
             ALOGE("unknown FFP_MSG_xxx(%d)\n", msg.what);
             break;
