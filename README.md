@@ -1,5 +1,63 @@
 # ijkplayer
 
+
+初步优化的方法（效果较弱）在live_mode分支     
+精简优化方法（有效）在live_mode_simple分支     
+     
+
+
+##直播优化
+
+针对HTTP-FLV方式的直播流优化
+
+1 **首帧优化**：
+
+ 预设值解析格式为flv，预设值解码器相关参数，使用新的简化读流函数替换avformat_find_stream_info
+
+ 方法：设置iformat为flv，使用live_find_stream_info代替avformat_find_stream_info 来快速设置metadata
+
+ 播放首帧中，首帧读取前关闭缓冲，不进行读取prepare等待，首帧不进行音画同步等待，最大程度加快首帧显示。
+
+ 方法：设置start_on_prepared，同时在视频渲染线程ffplay_video_thread中强制显示刷新首帧
+
+ 添加DNS地址预解析方法。(没有实现)
+
+2 **流畅率**：
+
+ 首帧前不设置缓冲，首帧后开启，设置最大缓冲时长为1s。
+ 抖动缓冲（取消了）
+
+3 **延时**：
+
+ 为保障直播实时性，添加的丢帧方法，该方法在读取线程（read_thread)中作丢帧检测和控制。
+
+
+  1）从packets队列中丢帧。
+
+  2）只丢音频帧以保证丢帧不会导致花屏。
+
+  3）每个单位时间内丢少量的帧，以保证播放不会出现卡顿。
+
+  4）丢帧控制的循环是一个GOP周期（视频的关键帧间隔时间），用GOP值而不用精准定时器，减少运算开销。
+
+  5）仅仅在播放中进行丢帧，缓冲或暂停中是不进行丢帧的。
+
+   动态丢帧界限控制：丢帧检测时长界限是动态变化的，使用单位时间内pts差变动作为丢帧时限变动的依据。通过计算比较时间间隔和进入帧队列中的音频数据的pts间隔来判定丢帧检测时长界限。
+
+4 **断流重启**：
+
+ 直播流流时长（duration）参数一直为0，因此当出现读帧出错或是断网等断流情况，直播流会直接终止播放，需要断流重启方法。
+
+ 断流重启方法会重新读取流数据的metadata，并重启设置解码器参数，然后开始重启播放流程。
+
+5 **重新发现音视频流**：
+
+ 直播中出现音频流信息缺失的情况，或是断流重启中需要重新启动音视频流。需要进行重新发现音视频流过程。
+
+
+
+
+
  Platform | Build Status
  -------- | ------------
  Android | [![Build Status](https://travis-ci.org/Bilibili/ci-ijk-ffmpeg-android.svg?branch=master)](https://travis-ci.org/Bilibili/ci-ijk-ffmpeg-android)
